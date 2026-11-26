@@ -165,11 +165,6 @@ make test     # Unit-Tests (Config-Parser, Ausgabeformat, Rate-Limiter, Datenlad
 make vet      # go vet
 ```
 
-Projektstruktur:
-
-```
-main.go              Server, Client, Config-Parser, Rate-Limiter, Ausgabeformat
-main_test.go         Tests
 examples/            Beispiel-Config und Beispiel-Daten
 contrib/iip.service  systemd-Unit
 Makefile             build / test / install
