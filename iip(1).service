@@ -1,0 +1,27 @@
+[Unit]
+Description=IIP - Internet Informations Protokoll Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/iip /etc/iip/iip.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Als eigener, unprivilegierter User laufen lassen. Die Dateien unter /etc/iip
+# muessen dafuer fuer alle lesbar sein (chmod 644).
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/iip
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Ports ab 1024 (z.B. der Standardport 65535) brauchen keine Sonderrechte.
+# Fuer Ports unter 1024 die folgenden zwei Zeilen aktivieren und
+# NoNewPrivileges=yes beibehalten:
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

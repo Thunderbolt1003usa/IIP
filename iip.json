@@ -1,0 +1,11 @@
+{
+  "hostname": "linuxmc.tech",
+  "ipv4": "203.0.113.10",
+  "ipv6": "2001:db8::1",
+  "organisation": "Beispiel Org",
+  "services": [
+    { "name": "tf2-server", "protocol": "udp", "port": 27015 },
+    { "name": "hugetube", "protocol": "https", "port": 443 }
+  ],
+  "updated": "2026-09-20T00:00:00Z"
+}
