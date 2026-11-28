@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -20,6 +23,7 @@ data_file = /tmp/x.json
 rate_limit = 2.5
 rate_limit_burst = 4
 max_response_size = 1200
+max_connections = 7
 unbekannt = egal
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -37,6 +41,7 @@ unbekannt = egal
 		RateLimit:       2.5,
 		RateLimitBurst:  4,
 		MaxResponseSize: 1200,
+		MaxConnections:  7,
 	}
 	if cfg != want {
 		t.Errorf("Config = %+v, erwartet %+v", cfg, want)
@@ -193,3 +198,169 @@ func TestIsConfigPath(t *testing.T) {
 		}
 	}
 }
+
+func TestListenFamily(t *testing.T) {
+	cases := map[string]string{
+		"0.0.0.0":        "4",
+		"127.0.0.1":      "4",
+		"::ffff:1.2.3.4": "4",
+		"::":             "6",
+		"::1":            "6",
+		"2001:db8::1":    "6",
+	}
+	for in, want := range cases {
+		if got := listenFamily(net.ParseIP(in)); got != want {
+			t.Errorf("listenFamily(%s) = %s, erwartet %s", in, got, want)
+		}
+	}
+}
+
+// ---------- Integrationstests: TCP + UDP auf demselben Port ----------
+
+const testData = `{"hostname":"test.example","ipv6":"2001:db8::1"}`
+
+func TestMain(m *testing.M) {
+	tcpIOTimeout = 500 * time.Millisecond // Tests sollen nicht auf 5 s Timeouts warten
+	os.Exit(m.Run())
+}
+
+// startTestServer startet TCP- und UDP-Listener auf demselben freien Loopback-Port.
+func startTestServer(t *testing.T, maxConns int, rate float64, burst int) int {
+	t.Helper()
+	for attempt := 0; attempt < 50; attempt++ {
+		tcpLn, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := tcpLn.Addr().(*net.TCPAddr).Port
+		udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			tcpLn.Close() // UDP-Port zufällig belegt, nächster Versuch
+			continue
+		}
+		store := &DataStore{bytes: []byte(testData)}
+		limiter := NewRateLimiter(rate, burst)
+		go serveTCP(tcpLn, store, limiter, maxConns)
+		go serveUDP(udpConn, store, limiter)
+		t.Cleanup(func() { tcpLn.Close(); udpConn.Close() })
+		return port
+	}
+	t.Fatal("kein Port gefunden, der für TCP und UDP frei ist")
+	return 0
+}
+
+func TestTCPAndUDPOnSamePort(t *testing.T) {
+	port := startTestServer(t, 10, 100, 100)
+
+	got, err := fetchTCP("127.0.0.1", port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("fetchTCP: %v", err)
+	}
+	if string(got) != testData {
+		t.Errorf("TCP-Antwort = %q, erwartet %q", got, testData)
+	}
+
+	got, err = fetchUDP("127.0.0.1", port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("fetchUDP: %v", err)
+	}
+	if string(got) != testData {
+		t.Errorf("UDP-Antwort = %q, erwartet %q", got, testData)
+	}
+}
+
+func TestTCPRequestVariants(t *testing.T) {
+	port := startTestServer(t, 10, 100, 100)
+	addr := net.JoinHostPort("127.0.0.1", itoa(port))
+
+	roundTrip := func(payload string, closeWrite bool) string {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		if closeWrite {
+			conn.(*net.TCPConn).CloseWrite()
+		}
+		b, _ := io.ReadAll(conn)
+		return string(b)
+	}
+
+	if got := roundTrip("get\n", false); got != testData {
+		t.Errorf("klein geschriebenes get + Zeilenumbruch: %q", got)
+	}
+	if got := roundTrip("GET\r\n", false); got != testData {
+		t.Errorf("GET mit CRLF: %q", got)
+	}
+	if got := roundTrip("GET", true); got != testData {
+		t.Errorf("GET ohne Zeilenumbruch, Sende-Richtung geschlossen: %q", got)
+	}
+	if got := roundTrip("HELLO\n", false); got != "" {
+		t.Errorf("falsche Anfrage sollte ohne Antwort bleiben, bekam %q", got)
+	}
+}
+
+func TestUDPIgnoresInvalidRequest(t *testing.T) {
+	port := startTestServer(t, 10, 100, 100)
+	conn, err := net.Dial("udp", net.JoinHostPort("127.0.0.1", itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	conn.Write([]byte("HELLO"))
+	buf := make([]byte, 100)
+	if n, err := conn.Read(buf); err == nil {
+		t.Errorf("falsche UDP-Anfrage sollte ohne Antwort bleiben, bekam %q", buf[:n])
+	}
+}
+
+func TestTCPMaxConnections(t *testing.T) {
+	port := startTestServer(t, 1, 100, 100)
+	addr := net.JoinHostPort("127.0.0.1", itoa(port))
+
+	// Verbindung 1 belegt den einzigen Platz, ohne etwas zu senden.
+	hold, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verbindung 2 wird vom Server sofort geschlossen.
+	second, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := second.Read(make([]byte, 10)); err != io.EOF || n != 0 {
+		t.Errorf("zweite Verbindung sollte geschlossen werden (EOF), bekam n=%d err=%v", n, err)
+	}
+
+	// Nach dem Timeout der ersten Verbindung ist der Platz wieder frei.
+	time.Sleep(tcpIOTimeout + 300*time.Millisecond)
+	if _, err := fetchTCP("127.0.0.1", port, 2*time.Second); err != nil {
+		t.Errorf("nach Freigabe des Platzes sollte eine Abfrage klappen: %v", err)
+	}
+}
+
+func TestTCPRateLimit(t *testing.T) {
+	port := startTestServer(t, 10, 0.001, 2) // praktisch nur der Burst von 2
+
+	for i := 0; i < 2; i++ {
+		if _, err := fetchTCP("127.0.0.1", port, 2*time.Second); err != nil {
+			t.Fatalf("Abfrage %d innerhalb des Bursts: %v", i+1, err)
+		}
+	}
+	if _, err := fetchTCP("127.0.0.1", port, 2*time.Second); err == nil {
+		t.Error("dritte Abfrage sollte durch das Rate-Limit ohne Antwort bleiben")
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
